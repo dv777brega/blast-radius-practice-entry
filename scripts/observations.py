@@ -8,6 +8,7 @@ import ast
 import atexit
 import builtins
 import collections
+import contextvars
 import enum
 import functools
 import hashlib
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import zlib
+import uuid
 
 
 REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
@@ -31,6 +33,9 @@ OPERATORS = {
 }
 active_test = None
 child_tests = 0
+child_launches = {}
+launch_in_progress = contextvars.ContextVar("observed_launch", default=False)
+executed_sources = set()
 starting_pool = False
 child_pid = None
 seen = set()
@@ -333,8 +338,33 @@ class SourceFinder(importlib.abc.MetaPathFinder):
 
 def audit(event, args):
     global child_tests
-    if active_test is not None and not starting_pool and event in ("os.fork", "subprocess.Popen", "os.posix_spawn"):
+    if event == "exec" and child_pid == os.getpid():
+        executed_sources.add(args[0].co_filename)
+    if (active_test is not None and not starting_pool and not launch_in_progress.get()
+            and event in ("os.fork", "subprocess.Popen", "os.posix_spawn", "os.exec")):
         child_tests |= active_test
+
+
+def track_python_launches():
+    """Attribute a fresh interpreter only after its shutdown report confirms tracing."""
+    original = subprocess.Popen.__init__
+
+    def start(process, args, *positional, **kwargs):
+        if (active_test is None or starting_pool or positional or kwargs.get("shell")
+                or kwargs.get("env") is not None or kwargs.get("executable") is not None
+                or not isinstance(args, (list, tuple)) or len(args) != 3
+                or args[1] != "-c" or args[0] not in ("python", "python3", sys.executable)):
+            return original(process, args, *positional, **kwargs)
+        token = uuid.uuid4().hex
+        child_launches[token] = active_test
+        env = dict(os.environ, BR_CHILD_TOKEN=token)
+        mark = launch_in_progress.set(True)
+        try:
+            return original(process, args, env=env, **kwargs)
+        finally:
+            launch_in_progress.reset(mark)
+
+    subprocess.Popen.__init__ = start
 
 
 def install(files):
@@ -362,6 +392,9 @@ def begin_child():
             return
         written = True
         path = Path(os.environ["BR_OBSERVATIONS_TEMP"]) / f"worker-{pid}"
+        token = os.environ.get("BR_CHILD_TOKEN")
+        if token:
+            (path.parent / ("launch-" + token)).write_bytes(marshal.dumps(sorted(executed_sources)))
         path.write_bytes(marshal.dumps((dict(relations), dict(reads), tuple(unsafe_reads),
                                         tuple(unsafe_compares), tuple(spread_edges), child_tests)))
     Finalize(None, flush, exitpriority=-10)
@@ -397,6 +430,7 @@ def merge_children(folder):
 
 
 def main():
+    global child_tests
     import pytest
     from time import monotonic
 
@@ -440,6 +474,7 @@ def main():
     os.environ["PYTHONPATH"] = os.pathsep.join((str(folder), str(Path(__file__).resolve().parent),
                                               os.environ.get("PYTHONPATH", "")))
     install(files)
+    track_python_launches()
     from observation_worker import track_submissions
     sys.modules["observations"] = sys.modules[__name__]
     track_submissions(sys.modules[__name__])
@@ -485,12 +520,23 @@ def main():
     if rc:
         raise SystemExit(int(rc))
     merge_children(folder)
+    child_modules = {}
+    for token, mask in child_launches.items():
+        report = folder / ("launch-" + token)
+        if not report.is_file():
+            child_tests |= mask
+            continue
+        for filename in marshal.loads(report.read_bytes()):
+            path = Path(filename)
+            if path.is_relative_to(root):
+                relative = path.relative_to(root).as_posix()
+                child_modules[relative] = child_modules.get(relative, 0) | mask
     scratch.cleanup()
     output.parent.mkdir(parents=True, exist_ok=True)
     data = dict(version=1, revision=head, sha256=hashes, tests=sorted(test_numbers),
                 declarations=sorted(declarations.values()), comparisons=sorted(source_sites),
                 relations=dict(relations), reads=dict(reads), unsafe=sorted(unsafe_reads,key=repr),
-                spreads=sorted(spread_edges), children=child_tests, factories=sorted(pure_factories),
+                spreads=sorted(spread_edges), children=child_tests, child_modules=child_modules, factories=sorted(pure_factories),
                 import_comparisons=sorted(unsafe_compares))
     output.write_bytes(zlib.compress(marshal.dumps(data), 9))
     print(f"{output.stat().st_size} bytes, {len(source_sites)} comparisons, "

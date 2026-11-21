@@ -83,6 +83,7 @@ class Observations:
         self.comparisons = set(data["comparisons"]).difference(data.get("import_comparisons", ()))
         self.unsafe = set(data["unsafe"])
         self.children = data["children"]
+        self.child_modules = data.get("child_modules", {})
         self.reads = data["reads"]
         self.relations = data["relations"]
         self.factories = set(data.get("factories", []))
@@ -94,7 +95,7 @@ class Observations:
     def data_mask(self, declaration, key):
         stack = [declaration]
         seen = set()
-        mask = self.children
+        mask = self.children | self.child_modules.get(declaration[0], 0)
         while stack:
             location = stack.pop()
             if location in seen:
@@ -120,7 +121,7 @@ class Observations:
             return None
         before = type(old.ops[0]).__name__
         after = type(new.ops[0]).__name__
-        mask = self.children & self.line_coverage.get(path, {}).get(old.lineno, self.children)
+        mask = (self.children | self.child_modules.get(path, 0)) & self.line_coverage.get(path, {}).get(old.lineno, self.children)
         for relation, tests in self.relations.get(site, {}).items():
             a = result_of(before, relation)
             b = result_of(after, relation)

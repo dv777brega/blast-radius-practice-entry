@@ -13,7 +13,7 @@ make sample
 python3 tools/benchmark.py --expand
 ```
 
-The supplied scorer reports 109.219 simulated seconds with zero misses on the 30 official sample patches. A three-run measurement on the development machine gave a median of 110.0 seconds including selector CPU. The expanded check renumbers the inventory and repeats sample inputs to verify scheduling on a 45-patch batch.
+The supplied scorer reports 101.747 simulated seconds with zero misses on the 30 official sample patches. A three-run measurement on the development machine gave a median of 102.6 seconds including selector CPU. The expanded check renumbers the inventory and repeats sample inputs to verify scheduling on a 45-patch batch.
 
 The validation programs in `tools/` run outside the scored image. `tools/label.py` runs pytest on independent clean snapshots, and `tools/mutants.py` generates a separate validation batch. The scorer's sample labels are never mounted in the scored container.
 
