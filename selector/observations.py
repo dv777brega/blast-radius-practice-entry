@@ -68,28 +68,6 @@ def result_of(op, relation):
     return None
 
 
-def _assign_target_name(node):
-    if not isinstance(node, (ast.AnnAssign, ast.Assign)):
-        return None
-    targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
-    if len(targets) != 1 or not isinstance(targets[0], ast.Name):
-        return None
-    return targets[0].id
-
-
-def _find_class_assign(tree, target_klass, target_name, klass=""):
-    for node in ast.iter_child_nodes(tree):
-        if isinstance(node, ast.ClassDef):
-            child_class = ".".join(filter(None, (klass, node.name)))
-            found = _find_class_assign(node, target_klass, target_name, child_class)
-            if found is not None:
-                return found
-        elif klass == target_klass and isinstance(node, (ast.AnnAssign, ast.Assign)):
-            if _assign_target_name(node) == target_name:
-                return node
-    return None
-
-
 class Observations:
     @classmethod
     def load(cls, path, tests):
@@ -151,114 +129,56 @@ class Observations:
                 mask |= tests
         return mask
 
-    def _dict_keys_mask(self, path, declaration, old, new):
-        if not (isinstance(old, ast.Dict) and isinstance(new, ast.Dict)):
-            return None
-        if any(k is None for k in old.keys) or any(k is None for k in new.keys):
-            return None
-        old_pairs = [(node_key(k), v) for k, v in zip(old.keys, old.values)]
-        new_pairs = [(node_key(k), v) for k, v in zip(new.keys, new.values)]
-        if any(k is None for k, _ in old_pairs) or any(k is None for k, _ in new_pairs):
-            return None
-        old_map = dict(old_pairs)
-        new_map = dict(new_pairs)
-        if len(old_map) != len(old_pairs) or len(new_map) != len(new_pairs):
-            return None
-        changed_keys = []
-        for k in old_map.keys() | new_map.keys():
-            if k not in old_map or k not in new_map:
-                v = old_map.get(k) or new_map.get(k)
-                pure = (isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
-                        and (path, v.func.id) in self.factories)
-                if not (passive(v) or pure):
-                    return None
-                changed_keys.append(k)
-            elif not equivalent(old_map[k], new_map[k]):
-                ov, nv = old_map[k], new_map[k]
-                pure = (isinstance(ov, ast.Call) and isinstance(ov.func, ast.Name)
-                        and (path, ov.func.id) in self.factories)
-                if not ((passive(ov) and passive(nv)) or (pure and closed_factory(ov, nv))):
-                    return None
-                changed_keys.append(k)
-        if not changed_keys:
-            return None
-        combined = 0
-        for key in changed_keys:
-            part = self.data_mask(declaration, key)
-            if part is None:
-                return None
-            combined |= part
-        return combined
-
     def refine(self, path, old_tree, new_tree, current_lines):
-        if not current_lines:
+        if len(current_lines) != 1:
             return {}
-        if len(current_lines) == 1:
-            line, = current_lines
-            old_nodes = [(node, klass) for node, klass in nodes_on_line(old_tree, line)]
-            new_nodes = {(type(node), node.col_offset, klass): node
-                         for node, klass in nodes_on_line(new_tree, line)}
-            for node, klass in old_nodes:
-                if isinstance(node, ast.Compare):
-                    fresh = new_nodes.get((type(node), node.col_offset, klass))
-                    if fresh is None:
-                        continue
-                    mask = self.compare_mask(path, node, fresh)
-                    if mask is None or equivalent(node.ops, fresh.ops):
-                        continue
-                    saved = fresh.ops
-                    fresh.ops = node.ops
-                    same = equivalent(old_tree, new_tree)
-                    fresh.ops = saved
-                    if same:
+        line, = current_lines
+        old_nodes = [(node, klass) for node, klass in nodes_on_line(old_tree, line)]
+        new_nodes = {(type(node), node.col_offset, klass): node
+                     for node, klass in nodes_on_line(new_tree, line)}
+        for node, klass in old_nodes:
+            fresh = new_nodes.get((type(node), node.col_offset, klass))
+            if fresh is None:
+                continue
+            if isinstance(node, ast.Compare):
+                mask = self.compare_mask(path, node, fresh)
+                if mask is None or equivalent(node.ops, fresh.ops):
+                    continue
+                saved = fresh.ops
+                fresh.ops = node.ops
+                same = equivalent(old_tree, new_tree)
+                fresh.ops = saved
+                if same:
+                    return {line: mask}
+            elif klass and isinstance(node, (ast.AnnAssign, ast.Assign)):
+                targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
+                if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                    continue
+                declaration = (path, klass, targets[0].id)
+                if declaration not in self.declarations:
+                    continue
+                old, new = node.value, fresh.value
+                key = None
+                if isinstance(old, ast.Dict) and isinstance(new, ast.Dict) and equivalent(old.keys, new.keys):
+                    changes = [i for i, (a, b) in enumerate(zip(old.values, new.values)) if not equivalent(a, b)]
+                    if len(changes) == 1:
+                        i = changes[0]
+                        value = old.values[i]
+                        pure = (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                                and (path, value.func.id) in self.factories)
+                        if passive(value) and passive(new.values[i]) or (pure and closed_factory(value, new.values[i])):
+                            key = node_key(old.keys[i])
+                elif passive(old) and passive(new):
+                    key = ("attr",)
+                if key is None:
+                    continue
+                fresh.value = old
+                same = equivalent(old_tree, new_tree)
+                fresh.value = new
+                if same:
+                    mask = self.data_mask(declaration, key)
+                    if mask is not None:
                         return {line: mask}
-                elif klass and isinstance(node, (ast.AnnAssign, ast.Assign)):
-                    target_name = _assign_target_name(node)
-                    if target_name is None:
-                        continue
-                    declaration = (path, klass, target_name)
-                    if declaration not in self.declarations:
-                        continue
-                    fresh = _find_class_assign(new_tree, klass, target_name)
-                    if fresh is None or fresh.value is None:
-                        continue
-                    old, new = node.value, fresh.value
-                    mask = self._dict_keys_mask(path, declaration, old, new)
-                    if mask is None and passive(old) and passive(new):
-                        mask = self.data_mask(declaration, ("attr",))
-                    if mask is None:
-                        continue
-                    fresh.value = old
-                    same = equivalent(old_tree, new_tree)
-                    fresh.value = new
-                    if same:
-                        return {line: mask}
-
-        # Handle multi-line / multi-entry edits within a single tracked class dict.
-        anchor = min(current_lines)
-        for node, klass in nodes_on_line(old_tree, anchor):
-            if not klass or not isinstance(node, (ast.AnnAssign, ast.Assign)):
-                continue
-            if not all(node.lineno <= ln <= node.end_lineno for ln in current_lines):
-                continue
-            target_name = _assign_target_name(node)
-            if target_name is None:
-                continue
-            declaration = (path, klass, target_name)
-            if declaration not in self.declarations:
-                continue
-            fresh = _find_class_assign(new_tree, klass, target_name)
-            if fresh is None or fresh.value is None:
-                continue
-            mask = self._dict_keys_mask(path, declaration, node.value, fresh.value)
-            if mask is None:
-                continue
-            saved = fresh.value
-            fresh.value = node.value
-            same = equivalent(old_tree, new_tree)
-            fresh.value = saved
-            if same:
-                return {ln: mask for ln in current_lines}
         return {}
 
 

@@ -11,19 +11,6 @@ from impact import Impact
 from schedule import Scheduler
 
 
-def mask_to_tests(mask, mapped, unknown):
-    chosen = set(unknown)
-    while mask:
-        lsb = mask & -mask
-        idx = lsb.bit_length() - 1
-        if idx < len(mapped):
-            test_num = mapped[idx]
-            if test_num is not None:
-                chosen.add(test_num)
-        mask ^= lsb
-    return frozenset(chosen)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=Path, default=Path("/data"))
@@ -36,8 +23,6 @@ def main():
     all_numbers = frozenset(t["number"] for t in tests)
     schedule = Scheduler(tests)
     engine = None
-    mapped = []
-    unknown = frozenset()
     try:
         index = marshal.loads(zlib.decompress((args.maps / "index.zlib").read_bytes()))
         if index["version"] != 1 or index["commit"] != "eb11aec4be8cb2122afe713a4816662c3f0fb2fa":
@@ -53,20 +38,17 @@ def main():
         unknown = all_numbers.difference(mapped)
     except Exception as error:
         print(f"coverage unavailable: {error}", file=sys.stderr)
-    all_cost = None
     for path in sorted((args.data / "commits").glob("*.patch")):
         try:
             chosen = all_numbers
             if engine is not None and time.monotonic() - started < 155:
                 mask = engine.changed(path.read_text("utf-8"))
-                if mask != engine.every:
-                    chosen = mask_to_tests(mask, mapped, unknown)
-                    if engine.risk:
-                        if all_cost is None:
-                            all_cost = schedule.plan(all_numbers)[0]
-                        premium = all_cost - schedule.plan(chosen)[0]
-                        if premium < 300_000 * min(1.0, engine.risk * args.risk_scale):
-                            chosen = all_numbers
+                chosen = frozenset(mapped[i] for i in range(len(mapped))
+                                   if mask & (1 << i) and mapped[i] is not None) | unknown
+                if engine.risk:
+                    premium = schedule.plan(all_numbers)[0] - schedule.plan(chosen)[0]
+                    if premium < 300_000 * min(1.0, engine.risk * args.risk_scale):
+                        chosen = all_numbers
             workers = schedule.plan(chosen)[1]
         except Exception as error:
             print(f"{path.stem}: {type(error).__name__}: {error}", file=sys.stderr)
