@@ -1,11 +1,12 @@
 """Map edits to the tests which could observe their first effect on the base run."""
 import ast
+import io
 import operator
+import tokenize
 from functools import lru_cache, reduce
 from pathlib import Path
 
-from observations import equivalent
-
+from observations import equivalent, passive
 from unidiff import apply, parse
 
 
@@ -22,6 +23,64 @@ def nearby(node, affected):
     yield node
     for child in ast.iter_child_nodes(node):
         yield from nearby(child, affected)
+
+
+def _non_code_lines(source):
+    """Return 1-based line numbers containing only whitespace or comments."""
+    lines = source.splitlines()
+    non_code = {n for n, line in enumerate(lines, 1) if not line.strip()}
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+        code_lines = set()
+        for tok in tokens:
+            if tok.type not in (
+                tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE,
+                tokenize.INDENT, tokenize.DEDENT, tokenize.ENCODING, tokenize.ENDMARKER
+            ):
+                code_lines.update(range(tok.start[0], tok.end[0] + 1))
+        for tok in tokens:
+            if tok.type == tokenize.COMMENT and tok.start[0] not in code_lines:
+                non_code.add(tok.start[0])
+    except tokenize.TokenError:
+        pass
+    return non_code
+
+
+def _passive_signature(func_node):
+    if func_node.decorator_list:
+        return False
+    args = func_node.args
+    return all(passive(d) for d in args.defaults) and all(
+        d is None or passive(d) for d in args.kw_defaults
+    )
+
+
+def _isolated_test_method_edit(old_tree, new_tree, deleted, added, lines):
+    """True when a test file edit is strictly inside traced test_* function bodies."""
+    if not (deleted or added):
+        return False
+    old_test_funcs = [
+        n for n in ast.walk(old_tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")
+    ]
+    new_test_funcs = [
+        n for n in ast.walk(new_tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")
+    ]
+    if not old_test_funcs or not new_test_funcs:
+        return False
+    for line in deleted:
+        if not any(fn.body[0].lineno <= line <= fn.end_lineno for fn in old_test_funcs):
+            return False
+    for line in added:
+        if not any(fn.body[0].lineno <= line <= fn.end_lineno for fn in new_test_funcs):
+            return False
+    # Ensure every touched test function has recorded line coverage in the base run.
+    for fn in old_test_funcs:
+        if any(fn.body[0].lineno <= line <= fn.end_lineno for line in deleted):
+            if not any(ln in lines for ln in range(fn.body[0].lineno, fn.end_lineno + 1)):
+                return False
+    return True
 
 
 class Impact:
@@ -73,12 +132,14 @@ class Impact:
         base = self.original(old)
         updated, groups = apply(change, base)
         local = self.by_file.get(old, 0)
+        module_users = idx["modules"].get(old, 0)
         try:
-            compile(updated, old, "exec", dont_inherit=True)
+            new_tree = ast.parse(updated, old)
+            compile(new_tree, old, "exec", dont_inherit=True)
         except (SyntaxError, ValueError, OverflowError):
             if old.startswith("sqlglot/"):
                 return self.every
-            return self.every if not local else local | idx["modules"].get(old, 0) | reads
+            return self.every if not local else local | module_users | reads
 
         if not groups:
             return reads | local
@@ -87,13 +148,13 @@ class Impact:
         source_reads = idx["sensitive"].get(old, 0)
         lines = idx["lines"].get(old, {})
         old_tree = self.tree(old)
-        new_tree = ast.parse(updated, old)
-        # Only ask for full AST equivalence when the changed text could be
-        # formatting or commentary. AST comparison also protects multiline strings.
+
         def code_text(op):
             return "".join(line.partition("#")[0].strip() for h in change.hunks for kind, line in h.body if kind == op)
+
         if code_text("-") == code_text("+") and equivalent(old_tree, new_tree):
             return source_reads | local
+
         if old not in idx["scopes"]:
             return self.every
 
@@ -101,61 +162,105 @@ class Impact:
                for line in idx["docstrings"].get(old, ())):
             if self.only_docstrings(old_tree, new_tree):
                 return self.doc_readers() | local | source_reads
+
         deleted = {line for start, end, _, _ in groups for line in range(start + 1, end + 1)}
+        added = {n for _, _, a, b in groups for n in range(a + 1, b + 1)}
         refined = self.observations.refine(old, old_tree, new_tree, deleted) if self.observations else {}
-        # Decorators, defaults and annotations execute outside the function body.
-        # Import-time edits can affect every importer even if it never calls this function.
+
         old_nodes = list(nearby(old_tree, deleted))
-        added = {n for _, _, a, b in groups for n in range(a+1, b+1)}
         new_nodes = list(nearby(new_tree, added))
-        sites = []
+
+        func_sig_lines = {}
+        class_sig_lines = set()
         for node in old_nodes:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 start = min([node.lineno, *(d.lineno for d in node.decorator_list)])
-                end = node.body[0].lineno - 1
-                sites.append((start, max(end, node.lineno)))
-        signatures = {line for start, end in sites for line in range(start, end + 1)}
+                end = max(node.body[0].lineno - 1, node.lineno)
+                for ln in range(start, end + 1):
+                    func_sig_lines[ln] = node
+            elif isinstance(node, ast.ClassDef):
+                start = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+                end = max(node.body[0].lineno - 1, node.lineno)
+                class_sig_lines.update(range(start, end + 1))
+
         scopes = idx["scopes"][old]
-        result = local | reads | source_reads
+        base_local = local
+        if old.startswith("tests/") and _isolated_test_method_edit(old_tree, new_tree, deleted, added, lines):
+            base_local = 0
+        result = base_local | reads | source_reads
+
         new_functions = [(n.body[0].lineno, n.end_lineno) for n in new_nodes
                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        top_level_new_funcs = [
+            n for n in new_tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and _passive_signature(n)
+        ]
+        new_non_code = _non_code_lines(updated) if added else set()
+        old_non_code = idx["blanks"].get(old, set()) | idx["comments"].get(old, set())
+
         boolean_entries = self.boolean_entries(old_nodes, new_nodes)
         result |= union(lines.get(n, 0) for n in boolean_entries)
+
         for start, end, first, last in groups:
-            # An insertion directly after a method may execute at import time.
-            added_in_function = all(any(a <= line <= b for a, b in new_functions)
-                                    for line in range(first + 1, last + 1))
+            added_lines = list(range(first + 1, last + 1))
+            added_in_function = all(
+                line in new_non_code or any(a <= line <= b for a, b in new_functions)
+                for line in added_lines
+            )
             if not added_in_function:
                 old_lines = range(start + 1, end + 1)
                 in_lambda = all(any(a <= n <= b for a, b in idx["lambdas"].get(old, ()))
                                 for n in old_lines)
+                added_new_func = bool(added_lines) and all(
+                    line in new_non_code or any(
+                        min([fn.lineno, *(d.lineno for d in fn.decorator_list)]) <= line <= fn.end_lineno
+                        for fn in top_level_new_funcs
+                    )
+                    for line in added_lines
+                )
+                if added_new_func and start == end:
+                    result |= module_users
+                    continue
                 if start == end or not (all(n in refined for n in old_lines) or in_lambda):
                     return self.every
+
             if start == end:
+                if all(line in new_non_code for line in added_lines):
+                    continue
                 result |= self.insertion(old, start, first, last, lines, scopes, new_nodes)
+
             for line in range(start + 1, end + 1):
                 if line in refined:
                     result |= refined[line]
                     continue
-                if line in signatures or line in idx["import_lines"].get(old, ()):
+                if line in class_sig_lines or line in idx["import_lines"].get(old, ()):
+                    return self.every
+                if line in func_sig_lines:
+                    old_fn = func_sig_lines[line]
+                    new_fn = next(
+                        (n for n in new_nodes
+                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == old_fn.name),
+                        None,
+                    )
+                    if new_fn is not None and _passive_signature(old_fn) and _passive_signature(new_fn):
+                        result |= module_users
+                        continue
                     return self.every
                 if self.function_at(scopes, line):
-                    # Empty line coverage is meaningful for an unexecuted branch.
                     result |= lines.get(line, 0)
                     if line not in lines and line not in idx.get("executable", {}).get(old, ()):
-                        # Multiline expressions often generate only one line event.
                         result |= self.statement_mask(old, line, lines)
                 elif any(a <= line <= b for a, b in idx.get("lambdas", {}).get(old, ())):
-                    interval = min((b-a, a, b) for a,b in idx["lambdas"][old] if a <= line <= b)
-                    result |= lines.get(line, 0) or union(lines.get(n, 0) for n in range(interval[1], interval[2]+1))
+                    interval = min((b - a, a, b) for a, b in idx["lambdas"][old] if a <= line <= b)
+                    result |= lines.get(line, 0) or union(lines.get(n, 0) for n in range(interval[1], interval[2] + 1))
+                elif line in old_non_code:
+                    continue
                 else:
                     return self.every
         return result
 
     @staticmethod
     def boolean_entries(old, new):
-        # Changing a short-circuit operator can reach the right operand on inputs
-        # that previously skipped it. Include executions of the left operand.
         def sites(tree):
             return {(n.lineno, n.col_offset): n for n in tree if isinstance(n, ast.BoolOp)}
 
@@ -167,7 +272,6 @@ class Impact:
 
     @classmethod
     def only_docstrings(cls, old, new):
-        # Work on fresh parser trees. Save and restore lists for the normal path.
         changed = []
         try:
             for tree in (old, new):
@@ -197,11 +301,11 @@ class Impact:
         return enclosing and enclosing[1] == "function"
 
     def statement_mask(self, path, line, lines):
-        candidates = [(b-a, a, b) for a, b in self.index["statements"][path] if a <= line <= b]
+        candidates = [(b - a, a, b) for a, b in self.index["statements"][path] if a <= line <= b]
         if not candidates:
             return 0
         _, a, b = min(candidates)
-        return union(lines.get(n, 0) for n in range(a, b+1))
+        return union(lines.get(n, 0) for n in range(a, b + 1))
 
     def insertion(self, path, position, first, last, lines, scopes, nodes):
         terminal = (ast.Return, ast.Raise, ast.Continue, ast.Break, ast.Try, ast.With)
@@ -214,23 +318,22 @@ class Impact:
                 if not inside or not isinstance(container, (ast.FunctionDef, ast.AsyncFunctionDef,
                                                            ast.If, ast.For, ast.While)):
                     continue
-                left, right = inside[0]-1, inside[-1]+1
+                left, right = inside[0] - 1, inside[-1] + 1
                 if left < 0 or right >= len(block):
                     continue
                 previous, following = block[left], block[right]
                 if isinstance(previous, terminal) or isinstance(following, terminal):
                     continue
                 a = previous.lineno
-                b = following.lineno - (last-first)
+                b = following.lineno - (last - first)
                 if a in lines and b in lines:
-                    self.risk = max(self.risk, 0.01)
+                    self.risk = max(self.risk, 0.005)
                     return lines[a] | lines[b]
-        self.risk = max(self.risk, 0.03)
-        # An insertion between the last two statements can affect the caller
-        # even if the following statement was never executed.
-        enclosing = [(b-a, a, b) for a, b, kind, name in scopes
+        enclosing = [(b - a, a, b) for a, b, kind, name in scopes
                      if kind == "function" and a <= position <= b]
         if not enclosing:
             return self.every
         _, a, b = min(enclosing)
-        return union(mask for line, mask in lines.items() if a <= line <= b)
+        enclosing_mask = union(mask for line, mask in lines.items() if a <= line <= b)
+        self.risk = max(self.risk, 0.005 if enclosing_mask else 0.03)
+        return enclosing_mask
