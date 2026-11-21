@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!requirements.lock
+!selector/
+!selector/*.py
+!scripts/
+!scripts/*.py
+!scripts/child_hooks/
+!scripts/child_hooks/*.py
+!maps/
+!maps/*.zlib
