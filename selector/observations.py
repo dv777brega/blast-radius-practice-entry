@@ -13,6 +13,10 @@ LITERAL_OPERATORS = {
 }
 
 
+_MEMBERSHIP = {ast.In: lambda value, options: value in options,
+               ast.NotIn: lambda value, options: value not in options}
+
+
 def equivalent(left, right):
     if type(left) is not type(right):
         return False
@@ -144,12 +148,10 @@ class Observations:
         site = (path, old.lineno, old.col_offset)
         if site not in self.comparisons or not isinstance(new, ast.Compare):
             return None
-        if len(old.ops) == len(new.ops) == 1 and equivalent(old.ops, new.ops):
-            return self.literal_mask(path, site, old, new)
-        if len(new.ops) != 1 or not equivalent(old.left, new.left) or not equivalent(
-            old.comparators, new.comparators
-        ):
+        if len(old.ops) != 1 or len(new.ops) != 1:
             return None
+        if not equivalent(old.left, new.left) or not equivalent(old.comparators, new.comparators):
+            return self.literal_mask(path, site, old, new)
         before = type(old.ops[0]).__name__
         after = type(new.ops[0]).__name__
         mask = (self.children | self.child_modules.get(path, 0)) & self.line_coverage.get(path, {}).get(old.lineno, self.children)
@@ -161,19 +163,33 @@ class Observations:
         return mask
 
     def literal_mask(self, path, site, old, new):
-        operation = LITERAL_OPERATORS.get(type(old.ops[0]))
-        if operation is None:
+        original_op = LITERAL_OPERATORS.get(type(old.ops[0]))
+        if original_op is None:
             return None
         before = (old.left, old.comparators[0])
         after = (new.left, new.comparators[0])
         for side, (original, replacement) in enumerate(zip(before, after)):
-            if not (isinstance(original, ast.Constant) and isinstance(replacement, ast.Constant)):
+            if not isinstance(original, ast.Constant) or type(original.value) not in (int, str):
                 continue
-            a, b = original.value, replacement.value
             other = 1 - side
-            if (type(a) not in (int, str) or type(a) is not type(b) or a == b
-                    or not equivalent(before[other], after[other])):
+            if not equivalent(before[other], after[other]):
                 continue
+            a = original.value
+            new_op = LITERAL_OPERATORS.get(type(new.ops[0]))
+            if side == 1 and isinstance(new.ops[0], (ast.In, ast.NotIn)):
+                if not isinstance(replacement, (ast.List, ast.Tuple)) or not all(
+                    isinstance(el, ast.Constant) and type(el.value) is type(a)
+                    for el in replacement.elts
+                ):
+                    continue
+                b = tuple(el.value for el in replacement.elts)
+                new_op = _MEMBERSHIP[type(new.ops[0])]
+            else:
+                if new_op is None or not isinstance(replacement, ast.Constant):
+                    continue
+                b = replacement.value
+                if type(a) is not type(b):
+                    continue
             seen = self.relations.get((site, other))
             if not seen:
                 return None
@@ -181,9 +197,9 @@ class Observations:
             for item, tests in seen.items():
                 if item is None or item[0] != type(a).__name__:
                     mask |= tests
-                elif side == 0 and operation(a, item[1]) != operation(b, item[1]):
+                elif side == 0 and original_op(a, item[1]) != new_op(b, item[1]):
                     mask |= tests
-                elif side == 1 and operation(item[1], a) != operation(item[1], b):
+                elif side == 1 and original_op(item[1], a) != new_op(item[1], b):
                     mask |= tests
             return mask
         return None
