@@ -3,7 +3,14 @@
 import ast
 import collections
 import marshal
+import operator
 import zlib
+
+
+LITERAL_OPERATORS = {
+    ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt,
+    ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge,
+}
 
 
 def equivalent(left, right):
@@ -137,6 +144,8 @@ class Observations:
         site = (path, old.lineno, old.col_offset)
         if site not in self.comparisons or not isinstance(new, ast.Compare):
             return None
+        if len(old.ops) == len(new.ops) == 1 and equivalent(old.ops, new.ops):
+            return self.literal_mask(path, site, old, new)
         if len(new.ops) != 1 or not equivalent(old.left, new.left) or not equivalent(
             old.comparators, new.comparators
         ):
@@ -151,44 +160,55 @@ class Observations:
                 mask |= tests
         return mask
 
+    def literal_mask(self, path, site, old, new):
+        operation = LITERAL_OPERATORS.get(type(old.ops[0]))
+        if operation is None:
+            return None
+        before = (old.left, old.comparators[0])
+        after = (new.left, new.comparators[0])
+        for side, (original, replacement) in enumerate(zip(before, after)):
+            if not (isinstance(original, ast.Constant) and isinstance(replacement, ast.Constant)):
+                continue
+            a, b = original.value, replacement.value
+            other = 1 - side
+            if (type(a) not in (int, str) or type(a) is not type(b) or a == b
+                    or not equivalent(before[other], after[other])):
+                continue
+            seen = self.relations.get((site, other))
+            if not seen:
+                return None
+            mask = self.children | self.child_modules.get(path, 0)
+            for item, tests in seen.items():
+                if item is None or item[0] != type(a).__name__:
+                    mask |= tests
+                elif side == 0 and operation(a, item[1]) != operation(b, item[1]):
+                    mask |= tests
+                elif side == 1 and operation(item[1], a) != operation(item[1], b):
+                    mask |= tests
+            return mask
+        return None
+
     def _dict_keys_mask(self, path, declaration, old, new):
         if not (isinstance(old, ast.Dict) and isinstance(new, ast.Dict)):
             return None
-        if any(k is None for k in old.keys) or any(k is None for k in new.keys):
-            return None
-        old_pairs = [(node_key(k), v) for k, v in zip(old.keys, old.values)]
-        new_pairs = [(node_key(k), v) for k, v in zip(new.keys, new.values)]
-        if any(k is None for k, _ in old_pairs) or any(k is None for k, _ in new_pairs):
-            return None
-        old_map = dict(old_pairs)
-        new_map = dict(new_pairs)
-        if len(old_map) != len(old_pairs) or len(new_map) != len(new_pairs):
-            return None
-        changed_keys = []
-        for k in old_map.keys() | new_map.keys():
-            if k not in old_map or k not in new_map:
-                v = old_map.get(k) or new_map.get(k)
-                pure = (isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
-                        and (path, v.func.id) in self.factories)
-                if not (passive(v) or pure):
+        if equivalent(old.keys, new.keys):
+            combined = 0
+            for key_node, a, b in zip(old.keys, old.values, new.values):
+                if equivalent(a, b):
+                    continue
+                key = node_key(key_node)
+                pure = (isinstance(a, ast.Call) and isinstance(a.func, ast.Name)
+                        and (path, a.func.id) in self.factories and closed_factory(a, b))
+                if key is None or not ((passive(a) and passive(b)) or pure):
                     return None
-                changed_keys.append(k)
-            elif not equivalent(old_map[k], new_map[k]):
-                ov, nv = old_map[k], new_map[k]
-                pure = (isinstance(ov, ast.Call) and isinstance(ov.func, ast.Name)
-                        and (path, ov.func.id) in self.factories)
-                if not ((passive(ov) and passive(nv)) or (pure and closed_factory(ov, nv))):
+                bits = self.data_mask(declaration, key)
+                if bits is None:
                     return None
-                changed_keys.append(k)
-        if not changed_keys:
-            return None
-        combined = 0
-        for key in changed_keys:
-            part = self.data_mask(declaration, key)
-            if part is None:
-                return None
-            combined |= part
-        return combined
+                combined |= bits
+            return combined
+        # A key addition, deletion, or reorder can affect membership and iteration,
+        # even if no test fetched either key's value.
+        return None
 
     def refine(self, path, old_tree, new_tree, current_lines):
         if not current_lines:
@@ -204,12 +224,12 @@ class Observations:
                     if fresh is None:
                         continue
                     mask = self.compare_mask(path, node, fresh)
-                    if mask is None or equivalent(node.ops, fresh.ops):
+                    if mask is None or equivalent(node, fresh):
                         continue
-                    saved = fresh.ops
-                    fresh.ops = node.ops
+                    saved = fresh.left, fresh.ops, fresh.comparators
+                    fresh.left, fresh.ops, fresh.comparators = node.left, node.ops, node.comparators
                     same = equivalent(old_tree, new_tree)
-                    fresh.ops = saved
+                    fresh.left, fresh.ops, fresh.comparators = saved
                     if same:
                         return {line: mask}
                 elif klass and isinstance(node, (ast.AnnAssign, ast.Assign)):

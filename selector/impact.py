@@ -25,10 +25,13 @@ def nearby(node, affected):
         yield from nearby(child, affected)
 
 
-def _non_code_lines(source):
-    """Return 1-based line numbers containing only whitespace or comments."""
+def _non_code_lines(source, changed):
+    """Identify edited blank and comment-only lines outside multiline tokens."""
     lines = source.splitlines()
-    non_code = {n for n, line in enumerate(lines, 1) if not line.strip()}
+    possible = {n for n in changed if n <= len(lines) and
+                (not lines[n - 1].strip() or lines[n - 1].lstrip().startswith("#"))}
+    if not possible:
+        return set()
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
         code_lines = set()
@@ -38,49 +41,21 @@ def _non_code_lines(source):
                 tokenize.INDENT, tokenize.DEDENT, tokenize.ENCODING, tokenize.ENDMARKER
             ):
                 code_lines.update(range(tok.start[0], tok.end[0] + 1))
-        for tok in tokens:
-            if tok.type == tokenize.COMMENT and tok.start[0] not in code_lines:
-                non_code.add(tok.start[0])
+        return possible - code_lines
     except tokenize.TokenError:
-        pass
-    return non_code
+        return set()
+
 
 
 def _passive_signature(func_node):
-    if func_node.decorator_list:
-        return False
     args = func_node.args
+    parameters = [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
+    if (func_node.decorator_list or func_node.type_params or func_node.returns is not None
+            or any(param is not None and param.annotation is not None for param in parameters)):
+        return False
     return all(passive(d) for d in args.defaults) and all(
         d is None or passive(d) for d in args.kw_defaults
     )
-
-
-def _isolated_test_method_edit(old_tree, new_tree, deleted, added, lines):
-    """True when a test file edit is strictly inside traced test_* function bodies."""
-    if not (deleted or added):
-        return False
-    old_test_funcs = [
-        n for n in ast.walk(old_tree)
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")
-    ]
-    new_test_funcs = [
-        n for n in ast.walk(new_tree)
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")
-    ]
-    if not old_test_funcs or not new_test_funcs:
-        return False
-    for line in deleted:
-        if not any(fn.body[0].lineno <= line <= fn.end_lineno for fn in old_test_funcs):
-            return False
-    for line in added:
-        if not any(fn.body[0].lineno <= line <= fn.end_lineno for fn in new_test_funcs):
-            return False
-    # Ensure every touched test function has recorded line coverage in the base run.
-    for fn in old_test_funcs:
-        if any(fn.body[0].lineno <= line <= fn.end_lineno for line in deleted):
-            if not any(ln in lines for ln in range(fn.body[0].lineno, fn.end_lineno + 1)):
-                return False
-    return True
 
 
 class Impact:
@@ -184,10 +159,7 @@ class Impact:
                 class_sig_lines.update(range(start, end + 1))
 
         scopes = idx["scopes"][old]
-        base_local = local
-        if old.startswith("tests/") and _isolated_test_method_edit(old_tree, new_tree, deleted, added, lines):
-            base_local = 0
-        result = base_local | reads | source_reads
+        result = local | reads | source_reads
 
         new_functions = [(n.body[0].lineno, n.end_lineno) for n in new_nodes
                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
@@ -195,7 +167,7 @@ class Impact:
             n for n in new_tree.body
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and _passive_signature(n)
         ]
-        new_non_code = _non_code_lines(updated) if added else set()
+        new_non_code = _non_code_lines(updated, added) if added else set()
         old_non_code = idx["blanks"].get(old, set()) | idx["comments"].get(old, set())
 
         boolean_entries = self.boolean_entries(old_nodes, new_nodes)

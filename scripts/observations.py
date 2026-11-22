@@ -73,11 +73,29 @@ def plain_ordered(value):
     )
 
 
-def compare(site, operation, left, right):
-    result = OPERATORS[operation](left, right)
+def compare(site, operation, left, right, observed_side):
+    try:
+        result = OPERATORS[operation](left, right)
+    except Exception:
+        # Tests may deliberately catch a comparison error.
+        unsafe_compares.add(site)
+        raise
     if active_test is None:
         unsafe_compares.add(site)
         return result
+    # Store a bounded set of exact, side-tagged primitive operands for
+    # literal comparisons. A saturated site keeps its overflow tests.
+    if observed_side is not None:
+        value = left if observed_side == 0 else right
+        bucket = (site, observed_side)
+        if type(value) in (int, str) and (type(value) is int or len(value) <= 48):
+            entry = (type(value).__name__, value)
+            known = relations.get(bucket, {})
+            if len(known) >= 48 and entry not in known:
+                entry = None
+        else:
+            entry = None
+        record(0, bucket, entry)
     if left is right:
         # Arbitrary user classes (and NaN) can be unequal to themselves.
         if type(left) in (type(None), bool, int, str, bytes) or (
@@ -207,12 +225,18 @@ class Rewrite(ast.NodeTransformer):
         candidate = len(node.ops) == 1 and type(node.ops[0]).__name__ in OPERATORS and (
             constant_side(node.left) or constant_side(node.comparators[0])
         )
+        observed_side = None
+        if candidate and isinstance(node.ops[0], (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+            for side, operand in enumerate((node.left, node.comparators[0])):
+                if isinstance(operand, ast.Constant) and type(operand.value) in (int, str):
+                    observed_side = 1 - side
+                    break
         self.generic_visit(node)
         if candidate:
             site = (self.path, node.lineno, node.col_offset)
             source_sites[site] = True
             return call("_br_compare", [ast.Constant(site), ast.Constant(type(node.ops[0]).__name__),
-                                        node.left, node.comparators[0]], node)
+                                        node.left, node.comparators[0], ast.Constant(observed_side)], node)
         return node
 
     def visit_Attribute(self, node):

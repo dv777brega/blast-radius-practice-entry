@@ -2,7 +2,7 @@
 
 The image analyzes each patch against sqlglot at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. It resolves tests by pytest node ID using the mounted inventory, then schedules them across up to eight workers.
 
-The maps in `maps/` come from running the pinned, unmodified suite. They contain line coverage, files read, class attribute and dictionary accesses, and comparisons observed during the run. The instrumentation follows work into Python subprocesses and attributes each process-pool task to its submitting test. The selector compiles changed Python files, examines changed scopes and uses these observations to select tests. It falls back to the full inventory on unsupported patches and source import risks. The image build verifies the source fingerprints for both maps.
+The maps in `maps/` come from running the pinned, unmodified suite. They contain line coverage, files read, class attribute and dictionary accesses, and comparisons observed during the run. For comparisons with an integer or string literal, the map records the opposite operand when it is a built-in integer or short string. Tests with unrecorded operand values stay eligible. The instrumentation follows work into Python subprocesses and attributes each process-pool task to its submitting test. The selector compiles changed Python files, examines changed scopes and uses these observations to select tests. It falls back to the full inventory on unsupported patches and source import risks. The image build verifies the source fingerprints for both maps.
 
 ## Reproduce the local score
 
@@ -13,7 +13,7 @@ make sample
 python3 tools/benchmark.py --expand
 ```
 
-The supplied scorer reports 101.747 simulated seconds with zero misses on the 30 official sample patches. A three-run measurement on the development machine gave a median of 102.6 seconds including selector CPU. The expanded check renumbers the inventory and repeats sample inputs to verify scheduling on a 45-patch batch.
+The supplied scorer reports 101.747 simulated seconds with zero misses on the 30 official sample patches. The expanded check repeats public patches in a 45-patch batch, changes their names, shuffles the inventory and assigns sparse test numbers. It verifies that the same test node IDs are selected. A second pass alters durations and adds an unprofiled test to check that the selector includes it on every patch.
 
 The validation programs in `tools/` run outside the scored image. `tools/label.py` runs pytest on independent clean snapshots, and `tools/mutants.py` generates a separate validation batch. The scorer's sample labels are never mounted in the scored container.
 

@@ -95,6 +95,12 @@ def candidates(files):
                 op = source[start:end].strip()
                 if op in flips:
                     groups["operator"].append(Edit(path, start, end, " " + flips[op] + " "))
+                if op in ("==", "!=", "<", "<=", ">", ">="):
+                    for operand in (node.left, arg):
+                        if isinstance(operand, ast.Constant) and type(operand.value) is int:
+                            change("comparison-literal", operand, repr(operand.value + 1))
+                        if isinstance(operand, ast.Constant) and type(operand.value) is str:
+                            change("comparison-literal", operand, repr(operand.value + "_alt"))
             elif isinstance(node, ast.Constant) and type(node.value) is bool:
                 change("constant", node, repr(not node.value))
             elif isinstance(node, ast.Call) and len(node.args) >= 2 and node.lineno == node.end_lineno:
@@ -134,6 +140,8 @@ def main():
     parser.add_argument("destination", type=Path, help="new or empty validation-only directory")
     parser.add_argument("--seed", type=int, default=904271)
     parser.add_argument("--count", type=int, default=160)
+    parser.add_argument("--comparisons-only", action="store_true",
+                        help="generate edits to string literals and integer thresholds in comparisons")
     args = parser.parse_args()
     args.destination.mkdir(parents=True, exist_ok=True)
     if any(args.destination.iterdir()):
@@ -149,6 +157,8 @@ def main():
                "parsers", "optimizer", "executor", "lookup-key", "fixture"] * 2
               + ["new-function", "comment", "docstring", "whitespace", "test-file", "noncode",
                  "syntax", "import", "multi"])
+    if args.comparisons_only:
+        cycles = ["comparison-literal"]
     available = {group: defaultdict(list) for group in groups}
     for group, edits in groups.items():
         for edit in edits:

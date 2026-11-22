@@ -61,9 +61,8 @@ def run(image, data, answers, command):
 def expanded(source, target, answers):
     inventory = json.loads((source / "tests.json").read_bytes())
     rows = inventory["tests"]
-    ids = [r["number"] for r in rows]
     rng = random.Random(7801)
-    rng.shuffle(ids)
+    ids = rng.sample(range(100_000, 100_000 + 20 * len(rows)), len(rows))
     renumber = {}
     for r, replacement in zip(rows, ids):
         renumber[r["number"]] = replacement
@@ -75,7 +74,7 @@ def expanded(source, target, answers):
     changes = sorted((source / "commits").glob("*.patch"))
     for i in range(math.ceil(1.5*len(changes))):
         patch = changes[i % len(changes)]
-        name = f"validation_{i:04d}"
+        name = f"{rng.getrandbits(96):024x}"
         (target / "commits" / f"{name}.patch").write_bytes(patch.read_bytes())
         labels[name] = {"failing": [renumber[n] for n in answers[patch.stem]["failing"]]}
         originals[name] = patch.stem
@@ -121,6 +120,22 @@ def main():
                 if {restore[n] for n in selected(r)} != base[originals[r["commit"]]]:
                     raise ValueError("selection changed after renumbering")
             print("expanded and renumbered:", json.dumps(stats))
+
+            inventory_path = target / "tests.json"
+            inventory = json.loads(inventory_path.read_bytes())
+            # Stress the runtime contract with a new test and a different timing profile.
+            # Its real failure status is unknown, so only check its inclusion here.
+            unknown = max(t["number"] for t in inventory["tests"]) + 1
+            for index, test in enumerate(inventory["tests"]):
+                factor = 3 if index % 5 == 0 else 0.5
+                test["seconds"] = round(test["seconds"] * factor, 3)
+            inventory["tests"].append({"number": unknown, "id": "tests/validation.py::test_new",
+                                       "file": "tests/validation.py", "seconds": 0.013})
+            inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+            changed, records = run(args.image, target, labels, command)
+            if any(unknown not in selected(record) for record in records):
+                raise ValueError("unprofiled inventory test was omitted")
+            print("altered durations and additional test (synthetic):", json.dumps(changed))
 
 
 if __name__ == "__main__":
