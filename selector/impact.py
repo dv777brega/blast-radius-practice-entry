@@ -1,6 +1,7 @@
 """Map edits to the tests which could observe their first effect on the base run."""
 import ast
 import io
+import marshal
 import operator
 import tokenize
 from functools import lru_cache, reduce
@@ -110,12 +111,27 @@ class Impact:
         module_users = idx["modules"].get(old, 0)
         try:
             new_tree = ast.parse(updated, old)
-            compile(new_tree, old, "exec", dont_inherit=True)
+            compiled = compile(new_tree, old, "exec", dont_inherit=True)
         except (SyntaxError, ValueError, OverflowError):
             if old.startswith("sqlglot/"):
                 return self.every
             return self.every if not local else local | module_users | reads
 
+        mask = self.python_impact(old, base, updated, groups, change, local, module_users, reads, new_tree)
+        if mask != self.every:
+            return mask
+        # Compare complete code objects, including nested functions and line tables.
+        # Also check optimized interpreters, which can compile assertions differently.
+        for level in (0, 1, 2):
+            original = compile(base, old, "exec", dont_inherit=True, optimize=level)
+            candidate = compiled if level == 0 else compile(new_tree, old, "exec", dont_inherit=True, optimize=level)
+            # Format 2 omits reference-count flags introduced in format 3.
+            if original != candidate or marshal.dumps(original, 2) != marshal.dumps(candidate, 2):
+                return mask
+        return local | reads | idx["sensitive"].get(old, 0)
+
+    def python_impact(self, old, base, updated, groups, change, local, module_users, reads, new_tree):
+        idx = self.index
         if not groups:
             return reads | local
         if base == updated:
